@@ -1,0 +1,69 @@
+# Chạy local và trên VM OpenStack bằng CÙNG một file.
+#   cp .env.example .env   # điền giá trị
+#   docker compose up -d --build        # local: chạy tất cả (db, minio, api, web)
+# Lần đầu khởi động với volume trống, PostgreSQL tự nạp schema.sql rồi seed.sql.
+# Muốn nạp lại từ đầu: docker compose down -v && rm -rf data/postgres && docker compose up -d db
+#
+# Trên VM thật:
+#   vm-data: DATA_DIR=/srv/data;  docker compose up -d db minio
+#   vm-app : DB_HOST, MINIO_ENDPOINT = IP nội bộ vm-data;  docker compose up -d --build api web (worker khi sẵn sàng)
+# api KHÔNG khai báo depends_on db/minio để trên vm-app không vô tình khởi động db/minio cục bộ;
+# api tự chờ CSDL lúc khởi động (app/seed_passwords.py) và restart: unless-stopped lo phần còn lại.
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
+    volumes:
+      - ${DATA_DIR:-./data}/postgres:/var/lib/postgresql/data
+      - ./backend/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./seed/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      retries: 5
+
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ${DATA_DIR:-./data}/minio:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  api:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"          # chỉ để thử local; trên VM sg-app chỉ mở 80/443
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Bỏ chú thích khi mô-đun worker sẵn sàng (Người 2, 6).
+  # worker:
+  #   build: ./worker
+  #   restart: unless-stopped
+  #   env_file: .env
+
+  web:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on: [api]
+    ports:
+      - "80:80"
